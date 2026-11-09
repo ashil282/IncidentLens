@@ -12,6 +12,7 @@ class OpenIncidentRequest(BaseModel):
     summary: str = Field(min_length=1, max_length=4000)
     actor: str = Field(default="system", min_length=1, max_length=120)
 
+
 class IncidentUpdateRequest(BaseModel):
     status: Literal["OPEN", "ACKNOWLEDGED", "RESOLVED"] | None = None
     severity: Literal["low", "medium", "high", "critical"] | None = None

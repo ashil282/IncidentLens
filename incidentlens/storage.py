@@ -36,19 +36,14 @@ class EventStore:
                 )
             """)
             connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_events_time "
-                "ON events(timestamp DESC)"
+                "CREATE INDEX IF NOT EXISTS idx_events_time ON events(timestamp DESC)"
             )
             connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_events_service "
-                "ON events(service, environment)"
+                "CREATE INDEX IF NOT EXISTS idx_events_service ON events(service, environment)"
             )
 
     def insert_many(self, events: Iterable[EventIn]) -> list[EventRecord]:
-        records = [
-            EventRecord.model_validate(event.model_dump())
-            for event in events
-        ]
+        records = [EventRecord.model_validate(event.model_dump()) for event in events]
         with self._connect() as connection:
             connection.executemany(
                 """
@@ -94,9 +89,7 @@ class EventStore:
             attributes=json.loads(row["attributes_json"]),
         )
 
-    def list_events(
-        self, limit: int = 100, service: str | None = None
-    ) -> list[EventRecord]:
+    def list_events(self, limit: int = 100, service: str | None = None) -> list[EventRecord]:
         query, params = "SELECT * FROM events", []
         if service:
             query += " WHERE service = ?"

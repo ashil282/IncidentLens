@@ -37,9 +37,14 @@ def get_incident(incident_id: str,
 def update_incident(incident_id: str, payload: IncidentUpdateRequest,
                     store: Annotated[IncidentLifecycleStore, Depends(get_lifecycle_store)]):
     try:
-        data = payload.model_dump(exclude_unset=True)
-        actor = data.pop("actor", "operator")
-        incident = store.update(incident_id, actor=actor, **data)
+        update_data = payload.model_dump(exclude_unset=True)
+        actor = update_data.pop("actor", "operator")
+
+        incident = store.update(
+            incident_id,
+            actor=actor,
+            **update_data
+        )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if not incident:

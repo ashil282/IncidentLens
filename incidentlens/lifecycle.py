@@ -170,8 +170,11 @@ class IncidentLifecycleStore:
                            (assignee, now, incident_id))
                 details["assignee"] = {"from": row["assignee"], "to": assignee}
             if resolution_note is not None:
-                conn.execute("UPDATE incidents SET resolution_note = ?, updated_at = ? WHERE id = ?",
-                           (resolution_note, now, incident_id))
+                conn.execute(
+                    "UPDATE incidents SET resolution_note = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (resolution_note, now, incident_id),
+                )
                 details["resolution_note"] = "updated"
             if details:
                 conn.execute("""
