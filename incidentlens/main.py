@@ -7,6 +7,8 @@ from fastapi.responses import JSONResponse
 
 from incidentlens.config import get_settings
 from incidentlens.detection import detect_incidents
+from incidentlens.lifecycle import IncidentLifecycleStore
+from incidentlens.lifecycle_api import router as lifecycle_router
 from incidentlens.schemas import EventBatch, EventIn, IngestResult
 from incidentlens.storage import EventStore
 
@@ -24,6 +26,8 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.store = EventStore(settings.database_path)
     app.state.store.initialize()
+    app.state.lifecycle_store = IncidentLifecycleStore(settings.database_path)
+    app.state.lifecycle_store.initialize()
     logger.info("storage initialized")
     yield
 
@@ -31,9 +35,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="IncidentLens API",
     description="Local-first incident investigation with evidence-backed reports.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
+app.include_router(lifecycle_router)
 
 
 @app.exception_handler(Exception)
@@ -87,7 +92,7 @@ def list_events(
 
 
 @app.get("/v1/incidents", tags=["incidents"])
-def list_incidents(
+def list_detected_incidents(
     store: Annotated[EventStore, Depends(get_store)],
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
 ):
@@ -95,7 +100,7 @@ def list_incidents(
 
 
 @app.get("/v1/incidents/{incident_id}", tags=["incidents"])
-def get_incident(incident_id: str, store: Annotated[EventStore, Depends(get_store)]):
+def get_detected_incident(incident_id: str, store: Annotated[EventStore, Depends(get_store)]):
     for report in detect_incidents(store.list_events(limit=500)):
         if report.id == incident_id:
             return report
