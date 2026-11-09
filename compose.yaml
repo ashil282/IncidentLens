@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      INCIDENTLENS_DATABASE_PATH: /app/data/incidentlens.db
+      INCIDENTLENS_LOG_LEVEL: INFO
+      INCIDENTLENS_MAX_BATCH_SIZE: 500
+    volumes:
+      - incidentlens-data:/app/data
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    restart: unless-stopped
+volumes:
+  incidentlens-data:
