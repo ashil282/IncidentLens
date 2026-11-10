@@ -1,186 +1,166 @@
-"""Persistent incident lifecycle and append-only activity history."""
-import hashlib
-import json
-import sqlite3
+"""Incident lifecycle store supporting PostgreSQL and SQLite backends."""
+
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
-VALID_STATES = {"OPEN", "ACKNOWLEDGED", "RESOLVED"}
-VALID_SEVERITIES = {"low", "medium", "high", "critical"}
+from fastapi import HTTPException
+from sqlalchemy import select
 
-def utcnow():
-    return datetime.now(UTC).isoformat()
+from incidentlens.database import Database
+from incidentlens.models import Incident, IncidentActivity
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+VALID_TRANSITIONS = {
+    "OPEN": {"ACKNOWLEDGED", "RESOLVED"},
+    "ACKNOWLEDGED": {"RESOLVED", "OPEN"},
+    "RESOLVED": {"OPEN"},
+}
+
 
 class IncidentLifecycleStore:
-    def __init__(self, database_path: Path):
-        self.database_path = database_path
+    def __init__(self, database_or_path: Database | str | Path):
+        if isinstance(database_or_path, Database):
+            self.database = database_or_path
+        else:
+            from incidentlens.config import Settings
 
-    def _connect(self):
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.database_path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 5000")
-        return conn
+            self.database = Database(Settings(database_path=database_or_path))
 
-    def initialize(self):
-        with self._connect() as conn:
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS incidents (
-                    id TEXT PRIMARY KEY,
-                    fingerprint TEXT NOT NULL,
-                    detector_id TEXT NOT NULL,
-                    service TEXT NOT NULL,
-                    environment TEXT NOT NULL,
-                    title TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    summary TEXT NOT NULL,
-                    assignee TEXT,
-                    resolution_note TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    acknowledged_at TEXT,
-                    resolved_at TEXT
-                );
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_incidents_active_fingerprint
-                    ON incidents(fingerprint) WHERE status != 'RESOLVED';
-                CREATE INDEX IF NOT EXISTS idx_incidents_status_updated
-                    ON incidents(status, updated_at DESC);
-                CREATE INDEX IF NOT EXISTS idx_incidents_service
-                    ON incidents(service, environment);
-                CREATE TABLE IF NOT EXISTS incident_activity (
-                    id TEXT PRIMARY KEY,
-                    incident_id TEXT NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
-                    action TEXT NOT NULL,
-                    actor TEXT NOT NULL,
-                    details_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_activity_incident_time
-                    ON incident_activity(incident_id, created_at);
-            """)
+    def open_or_get(
+        self,
+        detector_id: str,
+        service: str,
+        environment: str,
+        title: str,
+        severity: str,
+        summary: str,
+        actor: str,
+    ) -> Incident:
+        with self.database.session_scope() as session:
+            statement = select(Incident).where(
+                Incident.detector_id == detector_id,
+                Incident.service == service,
+                Incident.environment == environment,
+                Incident.status.in_(["OPEN", "ACKNOWLEDGED"]),
+            )
+            existing = session.scalars(statement).first()
 
-    @staticmethod
-    def fingerprint(service, environment, detector_id):
-        raw = f"{service.lower()}|{environment.lower()}|{detector_id.lower()}"
-        return hashlib.sha256(raw.encode()).hexdigest()
+            if existing:
+                existing.summary = summary
+                existing.updated_at = datetime.now(UTC)
+                session.flush()
+                session.refresh(existing)
+                return existing
 
-    @staticmethod
-    def _incident(row):
-        return dict(row) if row else None
+            now = datetime.now(UTC)
+            incident = Incident(
+                fingerprint=uuid4().hex,
+                detector_id=detector_id,
+                service=service,
+                environment=environment,
+                title=title,
+                severity=severity,
+                summary=summary,
+                status="OPEN",
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(incident)
+            session.flush()
 
-    def open_or_get(self, *, detector_id, service, environment, title, severity, summary, actor):
-        fingerprint = self.fingerprint(service, environment, detector_id)
-        now = utcnow()
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM incidents WHERE fingerprint = ? AND status != 'RESOLVED'",
-                (fingerprint,)
-            ).fetchone()
-            if row:
-                incident_id = row["id"]
-                conn.execute(
-                    "UPDATE incidents SET updated_at = ?, summary = ?, severity = ? WHERE id = ?",
-                    (now, summary, severity, incident_id),
-                )
-                action = "EVENTS_CORRELATED"
-                details = {"summary": summary, "severity": severity}
-            else:
-                incident_id = str(uuid4())
-                conn.execute("""
-                    INSERT INTO incidents
-                    (id, fingerprint, detector_id, service, environment, title, severity,
-                     status, summary, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?)
-                """, (incident_id, fingerprint, detector_id, service, environment,
-                      title, severity, summary, now, now))
-                action = "INCIDENT_OPENED"
-                details = {"detector_id": detector_id, "severity": severity}
+            activity = IncidentActivity(
+                incident_id=incident.id,
+                actor=actor,
+                action="opened",
+                details={"summary": summary},
+            )
+            session.add(activity)
+            session.flush()
+            session.refresh(incident)
+            return incident
 
-            conn.execute("""
-                INSERT INTO incident_activity
-                (id, incident_id, action, actor, details_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (str(uuid4()), incident_id, action, actor,
-                  json.dumps(details, sort_keys=True), now))
-            return self.get(incident_id, conn=conn)
+    def get(self, incident_id: str) -> Incident | None:
+        with self.database.session_factory() as session:
+            return session.get(Incident, incident_id)
 
-    def get(self, incident_id, conn=None):
-        if conn is not None:
-            row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
-            return self._incident(row)
-        with self._connect() as connection:
-            return self.get(incident_id, conn=connection)
+    def activity(self, incident_id: str) -> list[IncidentActivity]:
+        with self.database.session_factory() as session:
+            statement = (
+                select(IncidentActivity)
+                .where(IncidentActivity.incident_id == incident_id)
+                .order_by(IncidentActivity.id.asc())
+            )
+            return list(session.scalars(statement).all())
 
-    def list(self, status=None, service=None, limit=100):
-        query, params, clauses = "SELECT * FROM incidents", [], []
-        if status:
-            clauses.append("status = ?")
-            params.append(status)
-        if service:
-            clauses.append("service = ?")
-            params.append(service)
-        if clauses:
-            query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY updated_at DESC LIMIT ?"
-        params.append(limit)
-        with self._connect() as conn:
-            return [dict(row) for row in conn.execute(query, params).fetchall()]
-
-    def activity(self, incident_id):
-        with self._connect() as conn:
-            return [dict(row) | {"details": json.loads(row["details_json"])}
-                    for row in conn.execute(
-                        "SELECT * FROM incident_activity WHERE incident_id = ? ORDER BY created_at",
-                        (incident_id,)).fetchall()]
-
-    def update(self, incident_id, *, actor, status=None, severity=None,
-               assignee=None, resolution_note=None):
-        now = utcnow()
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
-            if not row:
+    def update(
+        self,
+        incident_id: str,
+        status: str | None = None,
+        assignee: str | None = None,
+        resolution_note: str | None = None,
+        actor: str = "operator",
+        details: dict[Any, Any] | None = None,
+    ) -> Incident | None:
+        with self.database.session_scope() as session:
+            incident = session.get(Incident, incident_id)
+            if not incident:
                 return None
-            changes, details = [], {}
-            if status is not None and status != row["status"]:
-                if row["status"] == "RESOLVED" and status != "OPEN":
-                    raise ValueError("resolved incidents can only be reopened to OPEN")
-                changes.extend(["status = ?", "updated_at = ?"])
-                values = [status, now]
-                details["status"] = {"from": row["status"], "to": status}
-                if status == "ACKNOWLEDGED":
-                    changes.append("acknowledged_at = ?")
-                    values.append(now)
-                if status == "RESOLVED":
-                    changes.append("resolved_at = ?")
-                    values.append(now)
-                if status == "OPEN":
-                    changes.extend(["resolved_at = NULL"])
-                conn.execute("UPDATE incidents SET " + ", ".join(changes) +
-                             " WHERE id = ?", values + [incident_id])
-                changes = []
-            if severity is not None and severity != row["severity"]:
-                conn.execute("UPDATE incidents SET severity = ?, updated_at = ? WHERE id = ?",
-                           (severity, now, incident_id))
-                details["severity"] = {"from": row["severity"], "to": severity}
-            if assignee is not None and assignee != row["assignee"]:
-                conn.execute("UPDATE incidents SET assignee = ?, updated_at = ? WHERE id = ?",
-                           (assignee, now, incident_id))
-                details["assignee"] = {"from": row["assignee"], "to": assignee}
+
+            current_status = incident.status
+            target_status = status
+            if resolution_note is not None and target_status is None:
+                target_status = "RESOLVED"
+
+            if target_status is not None and target_status != current_status:
+                allowed = VALID_TRANSITIONS.get(current_status, set())
+                if target_status not in allowed:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Invalid transition from {current_status} to {target_status}",
+                    )
+                incident.status = target_status
+
+            if assignee is not None:
+                incident.assignee = assignee
+
             if resolution_note is not None:
-                conn.execute(
-                    "UPDATE incidents SET resolution_note = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    (resolution_note, now, incident_id),
-                )
-                details["resolution_note"] = "updated"
-            if details:
-                conn.execute("""
-                    INSERT INTO incident_activity
-                    (id, incident_id, action, actor, details_json, created_at)
-                    VALUES (?, ?, 'INCIDENT_UPDATED', ?, ?, ?)
-                """, (str(uuid4()), incident_id, actor,
-                      json.dumps(details, sort_keys=True), now))
-            return self.get(incident_id, conn=conn)
+                incident.resolution_note = resolution_note
+                incident.resolved_at = datetime.now(UTC)
+
+            incident.updated_at = datetime.now(UTC)
+            session.flush()
+
+            activity_action = incident.status.lower()
+            activity = IncidentActivity(
+                incident_id=incident.id,
+                actor=actor,
+                action=activity_action,
+                details=details or {"assignee": assignee, "resolution_note": resolution_note},
+            )
+            session.add(activity)
+            session.flush()
+            session.refresh(incident)
+            return incident
+
+    def list(
+        self,
+        status: str | None = None,
+        service: str | None = None,
+        limit: int = 100,
+    ) -> list[Incident]:
+        with self.database.session_factory() as session:
+            statement = select(Incident)
+            if status:
+                statement = statement.where(Incident.status == status)
+            if service:
+                statement = statement.where(Incident.service == service)
+            statement = statement.order_by(Incident.created_at.desc()).limit(limit)
+            return list(session.scalars(statement).all())

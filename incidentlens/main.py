@@ -6,6 +6,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from incidentlens.config import get_settings
+from incidentlens.database import Database
 from incidentlens.detection import detect_incidents
 from incidentlens.lifecycle import IncidentLifecycleStore
 from incidentlens.lifecycle_api import router as lifecycle_router
@@ -23,13 +24,21 @@ def get_store(request: Request) -> EventStore:
 async def lifespan(app: FastAPI):
     settings = get_settings()
     logging.basicConfig(level=settings.log_level.upper())
+
+    database = Database(settings)
     app.state.settings = settings
-    app.state.store = EventStore(settings.database_path)
-    app.state.store.initialize()
-    app.state.lifecycle_store = IncidentLifecycleStore(settings.database_path)
-    app.state.lifecycle_store.initialize()
-    logger.info("storage initialized")
-    yield
+    app.state.database = database
+    app.state.store = EventStore(database)
+    app.state.lifecycle_store = IncidentLifecycleStore(database)
+
+    try:
+        database.check_connection()
+        app.state.store.initialize()
+        logger.info("database connection established and tables initialized")
+        yield
+    finally:
+        database.dispose()
+        logger.info("database connections disposed")
 
 
 app = FastAPI(
